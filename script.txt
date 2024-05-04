@@ -1,0 +1,80 @@
+#!/bin/bash
+
+# Enable debugging to show commands being executed
+set -x
+
+# Define paths to bioinformatics tools
+FASTQC="fastqc"
+MULTIQC="multiqc"
+BWA="bwa"
+SAMTOOLS="samtools"
+FREEBAYES="freebayes"
+BCFTOOLS="bcftools"
+
+# Define directory paths and files
+WORK_DIR="/path/to/your/directory"
+REF_GENOME="${WORK_DIR}/hg19.fa"
+FASTQ_DIR="${WORK_DIR}/fastq_files"
+FASTQC_DIR="${WORK_DIR}/fastqc_results"
+MULTIQC_DIR="${WORK_DIR}/multiqc_report"
+BAM_DIR="${WORK_DIR}/bam_files"
+VCF_DIR="${WORK_DIR}/vcf_files"
+
+# Create directories if they do not exist
+mkdir -p ${FASTQC_DIR} ${MULTIQC_DIR} ${BAM_DIR} ${VCF_DIR}
+
+# Step 1: Quality Control with FastQC
+# Running FastQC on all .fq.gz files in the fastq_files directory
+echo "Running FastQC for quality assessment..."
+${FASTQC} ${FASTQ_DIR}/*.fq.gz -o ${FASTQC_DIR}
+
+# Step 2: Aggregate FastQC reports using MultiQC
+# MultiQC provides a comprehensive overview of the FastQC results
+echo "Aggregating FastQC reports using MultiQC..."
+${MULTIQC} ${FASTQC_DIR} -o ${MULTIQC_DIR}
+
+# Step 3: Index the reference genome
+# This step is necessary for read alignment
+echo "Indexing the reference genome using BWA..."
+${BWA} index ${REF_GENOME}
+
+# Define an array of sample names for iteration
+declare -a samples=("father" "mother" "proband")
+
+# Step 4: Process each sample for read mapping and post-processing
+for sample in "${samples[@]}"
+do
+    echo "Processing ${sample}..."
+    # Mapping reads using BWA-MEM with read group information
+    ${BWA} mem -R "@RG\tID:${sample}\tSM:${sample}" ${REF_GENOME} ${FASTQ_DIR}/${sample}_R1.fq.gz ${FASTQ_DIR}/${sample}_R2.fq.gz | \
+    ${SAMTOOLS} view -bS - | \
+    ${SAMTOOLS} sort -o ${BAM_DIR}/${sample}_sorted.bam
+
+    # Check for successful BAM file creation
+    if [ ! -f "${BAM_DIR}/${sample}_sorted.bam" ]; then
+        echo "Failed to create BAM for ${sample}. Exiting."
+        exit 1
+    fi
+
+    # Fix mate information and mark duplicates
+    # Necessary for accurate variant calling
+    samtools fixmate -m ${BAM_DIR}/${sample}_sorted.bam ${BAM_DIR}/${sample}_fixed.bam
+    samtools sort -o ${BAM_DIR}/${sample}_sorted_fixed.bam ${BAM_DIR}/${sample}_fixed.bam
+    samtools markdup -r ${BAM_DIR}/${sample}_sorted_fixed.bam ${BAM_DIR}/${sample}_dedup.bam
+
+    # Index the final BAM file for efficient access during variant calling
+    ${SAMTOOLS} index ${BAM_DIR}/${sample}_dedup.bam
+done
+
+# Step 5: Variant Calling with FreeBayes
+# FreeBayes is used to identify genetic variants from the sequenced data
+echo "Running FreeBayes for variant calling..."
+${FREEBAYES} -f ${REF_GENOME} --bam-list <(ls ${BAM_DIR}/*_dedup.bam) > ${VCF_DIR}/variants.vcf
+
+# Step 6: Post-Processing of Variant Calls with bcftools
+# Normalizing variants to ensure consistency and filtering out low-quality variants
+echo "Normalizing and filtering variants..."
+${BCFTOOLS} norm -f ${REF_GENOME} -m-any ${VCF_DIR}/variants.vcf | \
+${BCFTOOLS} filter -s LOWQUAL -g 10 -i'%QUAL>20' > ${VCF_DIR}/filtered_variants.vcf
+
+echo "Pipeline completed."
